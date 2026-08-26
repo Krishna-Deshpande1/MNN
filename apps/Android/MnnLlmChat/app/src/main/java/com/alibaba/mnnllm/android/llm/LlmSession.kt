@@ -10,6 +10,7 @@ import com.alibaba.mnnllm.android.modelsettings.ModelConfig
 import com.alibaba.mnnllm.android.model.ModelTypeUtils
 import com.alibaba.mnnllm.android.modelsettings.ModelConfig.Companion.getExtraConfigFile
 import com.google.gson.Gson
+import com.google.gson.JsonObject
 import timber.log.Timber
 import java.io.File
 import java.util.stream.Collectors
@@ -23,13 +24,37 @@ import com.alibaba.mnnllm.android.modelsettings.JinjaContext
 import com.alibaba.mnnllm.android.modelsettings.ModelConfig.Companion.loadConfig
 import com.alibaba.mnnllm.android.utils.FileSplitter
 import com.alibaba.mnnllm.android.qnn.QnnModule
+
+/**
+ * Optional per-session sampler-parameter overrides, applied in-memory to
+ * the config JSON before load()/initNative() - never persisted to disk.
+ *
+ * This exists specifically because the native Sampler object is
+ * constructed exactly once, inside Llm::load(), from whatever config
+ * values exist at that moment (transformers/llm/engine/src/llm.cpp:330,
+ * mSampler.reset(Sampler::createSampler(mContext, mConfig))) and is never
+ * rebuilt by a later set_config() call. Unlike enable_thinking - which IS
+ * re-applied live via setChatTemplate() on every set_config() call, so a
+ * post-load updateConfig() push works - these values MUST already be
+ * present before the initial load()/set_config() sequence to have any
+ * effect at all. Pushing them afterward via updateConfig() is a silent
+ * no-op: it updates the stored config JSON but the already-built Sampler
+ * never re-reads it.
+ */
+data class SamplerOverrides(
+    val topK: Int? = null,
+    val topP: Float? = null,
+    val minP: Float? = null
+)
+
 class LlmSession (
     private val modelId: String,
     override var sessionId: String,
     private val configPath: String,
     var savedHistory: List<ChatDataItem>?,
     var backendType: String? = null,
-    private val useCustomConfig: Boolean = true
+    private val useCustomConfig: Boolean = true,
+    private val samplerOverrides: SamplerOverrides? = null
 ): ChatSession{
     override var supportOmni: Boolean = false
     private var nativePtr: Long = 0
@@ -96,6 +121,21 @@ class LlmSession (
         }
         if (isQnn) {
             llmConfig.visualModel = "visual_qnn_${QnnModule.modelMiddleName()}.mnn"
+        }
+        // Applied here, before serialization/initNative(), since this is
+        // the only point that actually affects the native Sampler - see
+        // SamplerOverrides' kdoc for why a post-load updateConfig() push
+        // would silently do nothing. Only overrides fields explicitly
+        // provided; anything left null keeps the model's normal config
+        // untouched, same as if no override were passed at all.
+        samplerOverrides?.let { overrides ->
+            overrides.topK?.let { llmConfig.topK = it }
+            overrides.topP?.let { llmConfig.topP = it }
+            overrides.minP?.let { llmConfig.minP = it }
+            Log.i(
+                TAG,
+                "MNN_DEBUG applying sampler overrides: topK=${overrides.topK} topP=${overrides.topP} minP=${overrides.minP}"
+            )
         }
         Log.d(TAG, "MNN_DEBUG load initNative")
         nativePtr = initNative(
@@ -280,11 +320,48 @@ class LlmSession (
     }
 
     override fun updateThinking(thinking: Boolean) {
-        val loadedConfig = loadConfig(modelId)
-        loadedConfig?.let {
-            loadedConfig.jinja = Jinja(context = JinjaContext(enableThinking = thinking))
-            ModelConfig.saveConfig(getExtraConfigFile(modelId), loadedConfig)
-            updateConfig(Gson().toJson(loadedConfig))
+        updateThinking(thinking, persist = true)
+    }
+
+    /**
+     * Same as [updateThinking] but when [persist] is false, skips both the
+     * loadConfig(modelId) lookup/merge and the custom_config.json disk
+     * write, pushing just the jinja fragment to native directly.
+     *
+     * loadConfig(modelId) resolves the model's config file via
+     * ModelConfig.getDefaultConfigFile(), which only understands "local/",
+     * "Builtin/", and catalog-downloaded model IDs. A synthetic, non-catalog
+     * modelId (e.g. the headless benchmark path's "headless/$modelPath")
+     * matches none of those and getDefaultConfigFile returns null, so
+     * loadConfig(modelId) returns null and the persist=true path's
+     * `loadedConfig?.let { ... }` would silently no-op - thinking mode
+     * would never actually change. Bypassing that lookup avoids depending
+     * on it resolving at all, and keeps each headless call otherwise
+     * stateless (no custom_config.json sidecar left behind under its
+     * synthetic modelId), matching the RSS-isolation design principle: a
+     * fresh LlmSession per call, released afterward, nothing cached.
+     *
+     * Native set_config() merges the pushed JSON at the top level
+     * (mls::LlmSession::updateConfig in llm_session.cpp), so pushing just
+     * the "jinja" key is sufficient - it neither requires nor clobbers the
+     * rest of the model's config.
+     */
+    fun updateThinking(thinking: Boolean, persist: Boolean) {
+        if (persist) {
+            val loadedConfig = loadConfig(modelId)
+            loadedConfig?.let {
+                loadedConfig.jinja = Jinja(context = JinjaContext(enableThinking = thinking))
+                ModelConfig.saveConfig(getExtraConfigFile(modelId), loadedConfig)
+                updateConfig(Gson().toJson(loadedConfig))
+            }
+        } else {
+            val jinjaFragment = JsonObject()
+            jinjaFragment.add("jinja", Gson().toJsonTree(Jinja(context = JinjaContext(enableThinking = thinking))))
+            val configJson = jinjaFragment.toString()
+            updateConfig(configJson)
+            // TEMPORARY: tracing the enable_thinking push from Kotlin through
+            // to the native Jinja context. Remove once confirmed working.
+            Log.i("THINKDEBUG", "pushed jinja fragment: $configJson")
         }
     }
 

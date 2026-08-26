@@ -123,6 +123,25 @@ std::string trimLeadingWhitespace(const std::string& str) {
     return {it, str.end()};
 }
 
+// TEMPORARY DEBUG: keeps a multi-line rendered prompt on one logcat line
+// (embedded newlines otherwise split a single MNN_DEBUG call across
+// multiple physical lines, same issue seen and fixed on the Kotlin side).
+// Remove alongside the PROMPTDEBUG logging below once no longer needed.
+std::string EscapeNewlinesForLog(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        if (c == '\n') {
+            out += "\\n";
+        } else if (c == '\r') {
+            out += "\\r";
+        } else {
+            out += c;
+        }
+    }
+    return out;
+}
+
 std::string getUserString(const char* user_content, bool for_history, bool is_r1) {
     if (is_r1) {
         return "<|User|>" + std::string(user_content) + "<|Assistant|>" + (for_history ? "" : "<think>\n");
@@ -298,7 +317,24 @@ const MNN::Transformer::LlmContext * LlmSession::Response(const std::string &pro
     }
     
     MNN_DEBUG("submitNative prompt_string_for_debug count %s max_new_tokens_:%d", prompt_string_for_debug.c_str(), max_new_tokens_);
-    
+
+    // TEMPORARY DEBUG: log the EXACT post-chat-template prompt string that
+    // will actually be tokenized and fed to the model - as opposed to
+    // prompt_string_for_debug above, which is just the raw, un-templated
+    // history_ concatenation and looks identical regardless of whether a
+    // real chat template was applied downstream or not. apply_chat_template()
+    // is a public, const (side-effect-free) method on the prebuilt Llm
+    // engine, so this is safe to call here purely for inspection without
+    // affecting the real llm_->response(history_, ...) call below. If the
+    // model's own chat template failed to load (e.g. missing/empty at
+    // export time), the tokenizer's fallback is bare concatenation of role
+    // contents with NO role markers or assistant-turn cue at all - which
+    // would show up here as plainly missing any special tokens.
+    if (llm_) {
+        std::string rendered_prompt = llm_->apply_chat_template(history_);
+        MNN_DEBUG("PROMPTDEBUG rendered_chat_template_prompt: %s", EscapeNewlinesForLog(rendered_prompt).c_str());
+    }
+
     // Check for multimodal content in the full prompt
     auto multimodal_result = processMultimodalPrompt(full_prompt_text);
     restoreAndroidSteppingStatusIfNeeded(llm_);
@@ -437,6 +473,24 @@ void LlmSession::updateConfig(const std::string& config_json) {
         ReportLlmSetConfigToFirebase("update_config", config_str);
         llm_->set_config(config_str);
         MNN_DEBUG("Updated config applied: %s", current_config_.dump().c_str());
+        // TEMPORARY DEBUG: distinctly-tagged confirmation that "jinja"
+        // survived the merge into current_config_ before being handed to
+        // the prebuilt engine's set_config()/setChatTemplate(). This is as
+        // deep as we can log from our own compiled code - setChatTemplate()
+        // and Tokenizer::set_chat_template_context() live inside the
+        // prebuilt libMNN.so (see CMakeLists.txt: add_library(MNN SHARED
+        // IMPORTED)), not rebuilt as part of this app, so they can't be
+        // instrumented directly. The PROMPTDEBUG log in Response() (calling
+        // llm_->apply_chat_template(history_)) is the closest available
+        // proxy for whether chat_template_context_ actually took effect,
+        // since that call renders through the same context this sets.
+        // Remove alongside THINKDEBUG/PROMPTDEBUG once confirmed working.
+        if (current_config_.contains("jinja")) {
+            MNN_DEBUG("THINKDEBUG jinja present in current_config_ after merge: %s",
+                      current_config_["jinja"].dump().c_str());
+        } else {
+            MNN_DEBUG("THINKDEBUG jinja NOT present in current_config_ after merge");
+        }
     } else {
         MNN_DEBUG("LLM not initialized yet, config saved for later: %s", current_config_.dump().c_str());
     }

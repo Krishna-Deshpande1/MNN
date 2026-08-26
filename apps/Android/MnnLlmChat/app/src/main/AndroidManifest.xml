@@ -162,6 +162,21 @@
             android:exported="false"
             android:theme="@android:style/Theme.NoTitleBar.Fullscreen" />
 
+        <service
+            android:name=".benchmark.headless.HeadlessBenchmarkService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <receiver
+            android:name=".benchmark.headless.BenchmarkHeadlessReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.mnnllmchat.RUN_PROMPT" />
+            </intent-filter>
+        </receiver>
+
     </application>
 
 </manifest>

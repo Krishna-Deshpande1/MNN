@@ -1157,6 +1157,15 @@ class ModelMapper:
                     val = None
                     break
 
+            # Fallback: some configs (e.g. LoRA-merged, text-only checkpoints)
+            # flatten nested fields (like 'text_config.xxx') to the top level.
+            # If the nested lookup failed, retry with just the leaf attr name
+            # directly on src, before giving up.
+            if val is None and '.' in src_path:
+                leaf_attr = src_path.rsplit('.', 1)[-1]
+                if hasattr(src, leaf_attr):
+                    val = getattr(src, leaf_attr)
+
             # --- 2. Navigate to destination parent node ---
             dst_parts = dst_path.split('.')
             target = dst

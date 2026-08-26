@@ -64,14 +64,15 @@ class ChatService {
         chatDataItemList: List<ChatDataItem>?,
         supportOmni:Boolean,
         backendType: String? = null,
-        useCustomConfig: Boolean = true
+        useCustomConfig: Boolean = true,
+        samplerOverrides: SamplerOverrides? = null
     ): LlmSession {
         var sessionId:String = if (TextUtils.isEmpty(sessionIdParam)) {
             System.currentTimeMillis().toString()
         } else {
             sessionIdParam!!
         }
-        val session = LlmSession(modelId!!, sessionId, modelDir!!, chatDataItemList, backendType, useCustomConfig)
+        val session = LlmSession(modelId!!, sessionId, modelDir!!, chatDataItemList, backendType, useCustomConfig, samplerOverrides)
         session.supportOmni = supportOmni
         transformerSessionMap[sessionId] = session
         return session
