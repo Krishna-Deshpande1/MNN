@@ -70,6 +70,7 @@ class BenchmarkHeadlessReceiver : BroadcastReceiver() {
         const val EXTRA_TOP_K = "top_k"
         const val EXTRA_TOP_P = "top_p"
         const val EXTRA_MIN_P = "min_p"
+        const val EXTRA_BACKEND_TYPE = "backend_type"
         private const val TAG = "BenchmarkHeadlessReceiver"
     }
 
@@ -88,10 +89,11 @@ class BenchmarkHeadlessReceiver : BroadcastReceiver() {
         val topK = if (intent.hasExtra(EXTRA_TOP_K)) intent.getIntExtra(EXTRA_TOP_K, 0) else null
         val topP = if (intent.hasExtra(EXTRA_TOP_P)) intent.getFloatExtra(EXTRA_TOP_P, 0f) else null
         val minP = if (intent.hasExtra(EXTRA_MIN_P)) intent.getFloatExtra(EXTRA_MIN_P, 0f) else null
+        val backendType = intent.getStringExtra(EXTRA_BACKEND_TYPE)
         Log.i(
             TAG,
             "Received RUN_PROMPT run_id=$runId model_path=$modelPath max_tokens=$maxTokens " +
-                "top_k=$topK top_p=$topP min_p=$minP"
+                "top_k=$topK top_p=$topP min_p=$minP backend_type=$backendType"
         )
 
         if (modelPath.isNullOrBlank() || prompt.isNullOrBlank() || runId.isNullOrBlank()) {
@@ -111,6 +113,7 @@ class BenchmarkHeadlessReceiver : BroadcastReceiver() {
             topK?.let { putExtra(EXTRA_TOP_K, it) }
             topP?.let { putExtra(EXTRA_TOP_P, it) }
             minP?.let { putExtra(EXTRA_MIN_P, it) }
+            backendType?.let { putExtra(EXTRA_BACKEND_TYPE, it) }
         }
         // startForegroundService() from a BroadcastReceiver responding to an
         // external broadcast is an explicitly permitted background-start

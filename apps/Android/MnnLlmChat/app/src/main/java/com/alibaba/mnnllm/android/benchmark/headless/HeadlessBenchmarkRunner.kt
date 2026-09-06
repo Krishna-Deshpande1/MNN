@@ -31,7 +31,8 @@ class HeadlessBenchmarkRunner(private val context: Context) {
         maxTokens: Int = BenchmarkHeadlessReceiver.DEFAULT_MAX_TOKENS,
         topK: Int? = null,
         topP: Float? = null,
-        minP: Float? = null
+        minP: Float? = null,
+        backendType: String? = null
     ) {
         val powerSampler = PowerSampler(context)
         val thermalSampler = ThermalSampler(context)
@@ -67,6 +68,7 @@ class HeadlessBenchmarkRunner(private val context: Context) {
             Log.i(LOG_TAG, "run_id=$runId SAMPLER_OVERRIDE_TOP_K=${topK ?: "default"} " +
                 "SAMPLER_OVERRIDE_TOP_P=${topP ?: "default"} SAMPLER_OVERRIDE_MIN_P=${minP ?: "default"}")
 
+            Log.i(LOG_TAG, "run_id=$runId BACKEND_TYPE_OVERRIDE=${backendType ?: "default"}")
             val coldLoadStartMs = System.currentTimeMillis()
             val newSession = ChatService.provide().createLlmSession(
                 modelId,
@@ -74,6 +76,7 @@ class HeadlessBenchmarkRunner(private val context: Context) {
                 "headless_${runId}_${System.currentTimeMillis()}",
                 null,
                 false,
+                backendType = backendType,
                 samplerOverrides = samplerOverrides
             )
             session = newSession

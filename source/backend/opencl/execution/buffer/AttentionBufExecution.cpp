@@ -1137,6 +1137,7 @@ ErrorCode AttentionBufExecution::prefillResize(const std::vector<Tensor*>& input
 
         mKernel_rearrangeQ = runtime->buildKernel("attention_buf", "rearrange_q", buildOption,
                                                   mOpenCLBackend->getPrecision(), inputs[0], outputs[0]);
+        OPENCL_CHECK_KERNEL(mKernel_rearrangeQ);
         auto maxWorkGroupSize = static_cast<uint32_t>(runtime->getMaxWorkGroupSize(mKernel_rearrangeQ));
 
         mGlobalWorkSizeRearrgQ = {static_cast<uint32_t>(UP_DIV(seqlen, 4)), static_cast<uint32_t>(UP_DIV(headDim, 4)),
@@ -1175,6 +1176,7 @@ ErrorCode AttentionBufExecution::prefillResize(const std::vector<Tensor*>& input
         buildOption.emplace("-DOPENCL_PREFILL_ATTENTION");
         mKernel_rearrange = runtime->buildKernel("attention_buf", "rearrange_k", buildOption,
                                                  mOpenCLBackend->getPrecision(), inputs[0], outputs[0]);
+        OPENCL_CHECK_KERNEL(mKernel_rearrange);
         auto maxWorkGroupSize = static_cast<uint32_t>(runtime->getMaxWorkGroupSize(mKernel_rearrange));
 
         mGlobalWorkSizeRearrg = {static_cast<uint32_t>(UP_DIV(kvInputLen, 4)),
@@ -1220,6 +1222,7 @@ ErrorCode AttentionBufExecution::prefillResize(const std::vector<Tensor*>& input
         }
         mKernel_rearrangeMask = runtime->buildKernel("attention_buf", "rearrange_mask_shortprefill", buildOption,
                                                      mOpenCLBackend->getPrecision(), inputs[0], outputs[0]);
+        OPENCL_CHECK_KERNEL(mKernel_rearrangeMask);
         mGlobalWorkSizeRearrgM = {static_cast<uint32_t>(UP_DIV(maskQlen, 4)),
                                   static_cast<uint32_t>(UP_DIV(maskKvlen, 4)), static_cast<uint32_t>(batch)};
         auto maxWorkGroupSize = static_cast<uint32_t>(runtime->getMaxWorkGroupSize(mKernel_rearrangeMask));
@@ -1261,6 +1264,7 @@ ErrorCode AttentionBufExecution::prefillResize(const std::vector<Tensor*>& input
         buildOption.emplace("-DNUMHEAD_GROUP_SIZE=" + std::to_string(groupSize));
         mKernel_qk = runtime->buildKernel("attention_buf", "matmul_qk_div_mask_prefill", buildOption,
                                           mOpenCLBackend->getPrecision(), inputs[0], outputs[0]);
+        OPENCL_CHECK_KERNEL(mKernel_qk);
         mGlobalWorkSizeQk = {static_cast<uint32_t>(UP_DIV(seqlen, 4)), static_cast<uint32_t>(UP_DIV(mKvSeqlen, 4)),
                              static_cast<uint32_t>(numHead * batch)};
         auto maxWorkGroupSize = static_cast<uint32_t>(runtime->getMaxWorkGroupSize(mKernel_qk));
@@ -1326,6 +1330,7 @@ ErrorCode AttentionBufExecution::prefillResize(const std::vector<Tensor*>& input
         buildOption.emplace("-DSOFTMAX_LOCAL_SIZE=" + std::to_string(localSize));
         mKernel_softmax =
             runtime->buildKernel("softmax_buf", "softmax_v4_buf", buildOption, mOpenCLBackend->getPrecision());
+        OPENCL_CHECK_KERNEL(mKernel_softmax);
         mGlobalWorkSizeSoftMax = {static_cast<uint32_t>(localSize), static_cast<uint32_t>(UP_DIV(inside, 4)),
                                   static_cast<uint32_t>(outside)};
         auto maxWorkGroupSize = static_cast<uint32_t>(runtime->getMaxWorkGroupSize(mKernel_softmax));
@@ -1372,6 +1377,7 @@ ErrorCode AttentionBufExecution::prefillResize(const std::vector<Tensor*>& input
         }
         mKernel_rearrangeV = runtime->buildKernel("attention_buf", "rearrange_v", buildOption,
                                                   mOpenCLBackend->getPrecision(), inputs[0], outputs[0]);
+        OPENCL_CHECK_KERNEL(mKernel_rearrangeV);
         auto maxWorkGroupSize = static_cast<uint32_t>(runtime->getMaxWorkGroupSize(mKernel_rearrangeV));
 
         mGlobalWorkSizeRearrgV = {static_cast<uint32_t>(UP_DIV(headDim, 4)),
@@ -1419,6 +1425,7 @@ ErrorCode AttentionBufExecution::prefillResize(const std::vector<Tensor*>& input
         }
         mKernel_qkv = runtime->buildKernel("attention_buf", "matmul_qkv_prefill", buildOption,
                                            mOpenCLBackend->getPrecision(), inputs[0], outputs[0]);
+        OPENCL_CHECK_KERNEL(mKernel_qkv);
         auto maxWorkGroupSize = static_cast<uint32_t>(runtime->getMaxWorkGroupSize(mKernel_qkv));
         mGlobalWorkSizeQkv = {static_cast<uint32_t>(UP_DIV(headDim, 8)), static_cast<uint32_t>(UP_DIV(seqlen, 4)),
                               static_cast<uint32_t>(numHead * batch)};
@@ -1502,6 +1509,7 @@ ErrorCode AttentionBufExecution::decodeResize(const std::vector<Tensor*>& inputs
 
         mKernel_rearrange = runtime->buildKernel("attention_buf", "rearrange_k", buildOption,
                                                  mOpenCLBackend->getPrecision(), inputs[0], outputs[0]);
+        OPENCL_CHECK_KERNEL(mKernel_rearrange);
         auto maxWorkGroupSize = static_cast<uint32_t>(runtime->getMaxWorkGroupSize(mKernel_rearrange));
 
         mGlobalWorkSizeRearrg = {static_cast<uint32_t>(1), static_cast<uint32_t>(UP_DIV(headDim, 4)),
@@ -1545,6 +1553,7 @@ ErrorCode AttentionBufExecution::decodeResize(const std::vector<Tensor*>& inputs
         buildOption.emplace("-DNUMHEAD_GROUP_SIZE=" + std::to_string(group_size));
         mKernel_qk = runtime->buildKernel("attention_buf", "matmul_qk_decode", buildOption,
                                           mOpenCLBackend->getPrecision(), inputs[0], outputs[0]);
+        OPENCL_CHECK_KERNEL(mKernel_qk);
         mGlobalWorkSizeQk = {static_cast<uint32_t>(UP_DIV(mKvSeqlen, 4)), static_cast<uint32_t>(numHead)};
         auto maxWorkGroupSize = static_cast<uint32_t>(runtime->getMaxWorkGroupSize(mKernel_qk));
 
@@ -1592,6 +1601,7 @@ ErrorCode AttentionBufExecution::decodeResize(const std::vector<Tensor*>& inputs
         buildOption.emplace("-DSOFTMAX_LOCAL_SIZE=" + std::to_string(localSize));
         mKernel_softmax =
             runtime->buildKernel("softmax_buf", "softmax_in1_buf", buildOption, mOpenCLBackend->getPrecision());
+        OPENCL_CHECK_KERNEL(mKernel_softmax);
         mGlobalWorkSizeSoftMax = {static_cast<uint32_t>(localSize), static_cast<uint32_t>(inside),
                                   static_cast<uint32_t>(outside)};
         auto maxWorkGroupSize = static_cast<uint32_t>(runtime->getMaxWorkGroupSize(mKernel_softmax));
@@ -1642,6 +1652,7 @@ ErrorCode AttentionBufExecution::decodeResize(const std::vector<Tensor*>& inputs
         }
         mKernel_rearrangeV = runtime->buildKernel("attention_buf", "rearrange_v", buildOption,
                                                   mOpenCLBackend->getPrecision(), inputs[0], outputs[0]);
+        OPENCL_CHECK_KERNEL(mKernel_rearrangeV);
         auto maxWorkGroupSize = static_cast<uint32_t>(runtime->getMaxWorkGroupSize(mKernel_rearrangeV));
 
         mGlobalWorkSizeRearrgV = {static_cast<uint32_t>(UP_DIV(headDim, 4)), static_cast<uint32_t>(1),
@@ -1705,6 +1716,7 @@ ErrorCode AttentionBufExecution::decodeResize(const std::vector<Tensor*>& inputs
                 }
                 kernel[knl_idx] = mOpenCLBackend->getOpenCLRuntime()->buildKernel(
                     "attention_buf", kernelName[i], option, mOpenCLBackend->getPrecision());
+                OPENCL_CHECK_KERNEL(kernel[knl_idx]);
                 uint32_t maxWorkGroupSize =
                     static_cast<uint32_t>(mOpenCLBackend->getOpenCLRuntime()->getMaxWorkGroupSize(kernel[knl_idx]));
                 globalWorkSize[knl_idx] = {static_cast<uint32_t>(UP_DIV(headDim, itemC[i])),
@@ -1742,6 +1754,7 @@ ErrorCode AttentionBufExecution::decodeResize(const std::vector<Tensor*>& inputs
         }
         mKernel_qkv = runtime->buildKernel("attention_buf", kernelName[min_index], buildOption,
                                            mOpenCLBackend->getPrecision(), inputs[0], outputs[0]);
+        OPENCL_CHECK_KERNEL(mKernel_qkv);
 
         uint32_t index = 0;
         cl_int ret = CL_SUCCESS;
@@ -1816,11 +1829,17 @@ ErrorCode AttentionBufExecution::onResize(const std::vector<Tensor*>& inputs, co
                     if (mOpenCLBackend->getCLTuneLevel() != None) {
                         setRecordClose closeRecord(mOpenCLBackend);
                         // tuning choose use which prefill
-                        prefillResize(inputs, outputs);
+                        auto shortPrefillRes = prefillResize(inputs, outputs);
+                        if (NO_ERROR != shortPrefillRes) {
+                            return shortPrefillRes;
+                        }
                         auto shortPrefillTime = getExecuteTime();
                         init();
                         mLongPrefill = true;
-                        longPrefillResize(inputs, outputs);
+                        auto longPrefillRes = longPrefillResize(inputs, outputs);
+                        if (NO_ERROR != longPrefillRes) {
+                            return longPrefillRes;
+                        }
                         auto longPrefillTime = getExecuteTime();
                         mLongPrefill = false;
                         if (longPrefillTime < shortPrefillTime) {
@@ -1840,9 +1859,9 @@ ErrorCode AttentionBufExecution::onResize(const std::vector<Tensor*>& inputs, co
             }
         }
         if (mLongPrefill) {
-            longPrefillResize(inputs, outputs);
+            return longPrefillResize(inputs, outputs);
         } else {
-            prefillResize(inputs, outputs);
+            return prefillResize(inputs, outputs);
         }
     }
 

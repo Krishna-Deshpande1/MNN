@@ -11,6 +11,9 @@
 #include <sstream>
 #include <iomanip>
 #include <unordered_set>
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
 
 #include "prompt_cache_utils.hpp"
 #include <MNN/AutoTime.hpp>
@@ -50,6 +53,19 @@ static MNNForwardType backend_type_convert(const std::string& type_str) {
     if (type_str == "npu")
         return MNN_FORWARD_NN;
     return MNN_FORWARD_AUTO;
+}
+
+static std::string forwardTypeName(MNNForwardType type) {
+    switch (type) {
+        case MNN_FORWARD_CPU: return "cpu";
+        case MNN_FORWARD_METAL: return "metal";
+        case MNN_FORWARD_CUDA: return "cuda";
+        case MNN_FORWARD_OPENCL: return "opencl";
+        case MNN_FORWARD_OPENGL: return "opengl";
+        case MNN_FORWARD_VULKAN: return "vulkan";
+        case MNN_FORWARD_NN: return "npu";
+        default: return "unknown(" + std::to_string((int)type) + ")";
+    }
 }
 
 template <typename T>
@@ -223,6 +239,36 @@ void Llm::initRuntime() {
     config.backendConfig = &cpuBackendConfig;
 
     mRuntimeManager.reset(Executor::RuntimeManager::createRuntimeManager(config));
+    {
+        // Permanent, visible confirmation of which backend the runtime actually
+        // resolved to, as opposed to what was requested in config.type. MNN's
+        // Schedule::createBackend() silently substitutes config.backupType (CPU)
+        // when the requested MNNForwardType has no registered runtime creator
+        // (e.g. a GPU backend not compiled in) - this makes that substitution
+        // visible in logcat for every load instead of only showing up as a
+        // slower-than-expected run. Note: does not catch a per-op fallback
+        // where the runtime itself is created successfully for the requested
+        // type but an individual op (e.g. one without a GPU Creator) still
+        // falls back to CPU inside Pipeline::createUnit - that requires
+        // per-op tracing, not a single runtime-level check.
+        int actualBackend = -1;
+        mRuntimeManager->getInfo(Interpreter::BACKENDS, &actualBackend);
+        // Use __android_log_print directly rather than MNN_PRINT: this build
+        // sets MNN_USE_LOGCAT=false (see build_64.sh), which makes MNN_PRINT
+        // compile down to plain printf() - invisible in `adb logcat` since
+        // nothing redirects this process's stdout there. This confirmation
+        // line must reach logcat unconditionally, independent of that flag.
+#ifdef __ANDROID__
+        __android_log_print(ANDROID_LOG_INFO, "MNN_LLM_ACTUAL_BACKEND",
+                             "requested=%d(%s) actual=%d(%s)", (int)config.type,
+                             forwardTypeName((MNNForwardType)config.type).c_str(), actualBackend,
+                             forwardTypeName((MNNForwardType)actualBackend).c_str());
+#else
+        MNN_PRINT("MNN_LLM_ACTUAL_BACKEND requested=%d(%s) actual=%d(%s)\n", (int)config.type,
+                  forwardTypeName((MNNForwardType)config.type).c_str(), actualBackend,
+                  forwardTypeName((MNNForwardType)actualBackend).c_str());
+#endif
+    }
     setRuntimeHint(mRuntimeManager);
 
 #if DEBUG_MODE == 1

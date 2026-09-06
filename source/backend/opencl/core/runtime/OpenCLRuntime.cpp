@@ -18,6 +18,9 @@
 #include <MNN/AutoTime.hpp>
 #include "CLCache_generated.h"
 #include "backend/opencl/execution/cl/opencl_source_map.hpp"
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
 //#define ARM_OPENCL_PRINTF_DEBUG
 using namespace CLCache;
 namespace MNN {
@@ -484,6 +487,21 @@ bool OpenCLRuntime::buildProgram(const std::string &buildOptionsStr, cl::Program
     if (ret != CL_SUCCESS) {
         if (program->getBuildInfo<CL_PROGRAM_BUILD_STATUS>(*mFirstGPUDevicePtr) == CL_BUILD_ERROR) {
             std::string buildLog = program->getBuildInfo<CL_PROGRAM_BUILD_LOG>(*mFirstGPUDevicePtr);
+            // TEMPORARY DEBUG: MNN_PRINT compiles to plain printf() on Android
+            // when MNN_USE_LOGCAT=false (this build's setting - see
+            // build_64.sh), which never reaches `adb logcat`. Log the real
+            // clBuildProgram error text directly so it's actually visible
+            // while diagnosing the AttentionBufExecution kernel build
+            // failure. Remove (or fold back into MNN_PRINT) after
+            // investigation.
+#ifdef __ANDROID__
+            // err/log first: buildOptionsStr can be huge (~40+ -D flags),
+            // and a single __android_log_print call gets truncated by
+            // logcat's per-line length limit - putting buildOptions first
+            // was cutting off err/log (the actually useful part) entirely.
+            __android_log_print(ANDROID_LOG_ERROR, "MNN_OPENCL_BUILD_LOG", "err=%d log=%s buildOptions=%s",
+                                 ret, buildLog.c_str(), buildOptionsStr.c_str());
+#endif
             MNN_PRINT("Program build log: %s \n", buildLog.c_str());
         }
         MNN_PRINT("Build program failed, err:%d ! \n", ret);
@@ -670,6 +688,16 @@ std::shared_ptr<KernelWrap> OpenCLRuntime::buildKernelWithCache(const std::strin
         cl_int res;
         kernel.reset(new cl::Kernel(program, kernelName.c_str(), &res));
         if(res != CL_SUCCESS) {
+            // TEMPORARY DEBUG: same MNN_USE_LOGCAT=false visibility issue as
+            // buildProgram() above - this is the OTHER way buildKernel(...)
+            // returns nullptr: the program compiled fine but this specific
+            // kernel name couldn't be created from it. Remove after
+            // investigation.
+#ifdef __ANDROID__
+            __android_log_print(ANDROID_LOG_ERROR, "MNN_OPENCL_BUILD_LOG",
+                                 "getKernel program=%s kernel=%s error res=%d",
+                                 programName.c_str(), kernelName.c_str(), res);
+#endif
             MNN_ERROR("getKernel: %s error, res:%d\n", kernelName.c_str(), res);
             return nullptr;
         }

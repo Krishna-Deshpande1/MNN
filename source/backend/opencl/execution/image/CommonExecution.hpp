@@ -13,12 +13,33 @@
 #include "core/TensorUtils.hpp"
 #include "backend/opencl/core/OpenCLBackend.hpp"
 #include "backend/opencl/core/OpenCLRunningUtils.hpp"
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
 namespace MNN {
 namespace OpenCL {
+
+// TEMPORARY DEBUG: identify exactly which of the ~13+ OPENCL_CHECK_KERNEL(_CTOR)
+// guard sites is firing when a kernel comes back null, since the two known
+// buildKernel() failure paths (compile error in buildProgram(), kernel-name
+// lookup failure in buildKernelWithCache()) were both instrumented and
+// neither fired - meaning the null is coming from somewhere else, or one of
+// these guards is catching a kernel that failed for a still-unidentified
+// reason. Uses __android_log_print directly (not MNN_ERROR) because this
+// build's MNN_USE_LOGCAT=false makes MNN_ERROR invisible in `adb logcat`.
+// Remove both this logging and the include above after investigation.
+#ifdef __ANDROID__
+#define OPENCL_CHECK_KERNEL_GUARD_LOG(kernel) \
+    __android_log_print(ANDROID_LOG_ERROR, "MNN_OPENCL_KERNEL_GUARD", \
+                         "%s is null at %s:%d", #kernel, __FILE__, __LINE__);
+#else
+#define OPENCL_CHECK_KERNEL_GUARD_LOG(kernel)
+#endif
 
 // Check kernel after buildKernel in constructor; set mValid=false on failure
 #define OPENCL_CHECK_KERNEL_CTOR(kernel)  \
     if (kernel == nullptr) {              \
+        OPENCL_CHECK_KERNEL_GUARD_LOG(kernel) \
         mValid = false;                   \
         return;                           \
     }
@@ -26,6 +47,7 @@ namespace OpenCL {
 // Check kernel after buildKernel in onResize/onEncode; return NOT_SUPPORT on failure
 #define OPENCL_CHECK_KERNEL(kernel)       \
     if (kernel == nullptr) {              \
+        OPENCL_CHECK_KERNEL_GUARD_LOG(kernel) \
         return NOT_SUPPORT;               \
     }
 

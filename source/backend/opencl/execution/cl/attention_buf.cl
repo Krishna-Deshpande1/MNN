@@ -80,10 +80,19 @@ static inline void store_attention_c4_4(__global FLOAT* output, const FLOAT4 val
         vstore4(value, 0, output + offset);
         return;
     }
+    // Adreno's OpenCL C compiler rejects variable-indexed vector component
+    // access (e.g. value[i] where value is a FLOAT4 and i is a loop
+    // variable) with "Attempt to use subscript to obtain element of
+    // 'half8'" - vector components may only be accessed with a
+    // compile-time constant index on this compiler. Spill to a private
+    // scratch array first: arrays (unlike vector types) support variable
+    // indexing.
+    FLOAT scratch[4];
+    vstore4(value, 0, scratch);
     for (int i = 0; i < count; ++i) {
         const int c = channel + i;
         const int offset = ((c >> 2) * seq_storage + token) * 4 + (c & 3);
-        output[offset] = value[i];
+        output[offset] = scratch[i];
     }
 }
 
@@ -853,29 +862,40 @@ __kernel void matmul_qkv_prefill(GLOBAL_SIZE_3_DIMS
     if (channel_count == 8) {
         vstore8(CONVERT_FLOAT8(out0), 0, output + output_offset);
     } else {
+        // See store_attention_c4_4() above: variable-indexed vector
+        // component access is rejected by Adreno's OpenCL C compiler -
+        // spill to a private scratch array first.
         FLOAT8 value = CONVERT_FLOAT8(out0);
-        for (int i = 0; i < channel_count; ++i) output[output_offset + i] = value[i];
+        FLOAT scratch[8];
+        vstore8(value, 0, scratch);
+        for (int i = 0; i < channel_count; ++i) output[output_offset + i] = scratch[i];
     }
     if(y4 + 1 >= query_seq_len) return;
     if (channel_count == 8) {
         vstore8(CONVERT_FLOAT8(out1), 0, output + output_offset + stride);
     } else {
         FLOAT8 value = CONVERT_FLOAT8(out1);
-        for (int i = 0; i < channel_count; ++i) output[output_offset + stride + i] = value[i];
+        FLOAT scratch[8];
+        vstore8(value, 0, scratch);
+        for (int i = 0; i < channel_count; ++i) output[output_offset + stride + i] = scratch[i];
     }
     if(y4 + 2 >= query_seq_len) return;
     if (channel_count == 8) {
         vstore8(CONVERT_FLOAT8(out2), 0, output + output_offset + stride + stride);
     } else {
         FLOAT8 value = CONVERT_FLOAT8(out2);
-        for (int i = 0; i < channel_count; ++i) output[output_offset + stride + stride + i] = value[i];
+        FLOAT scratch[8];
+        vstore8(value, 0, scratch);
+        for (int i = 0; i < channel_count; ++i) output[output_offset + stride + stride + i] = scratch[i];
     }
     if(y4 + 3 >= query_seq_len) return;
     if (channel_count == 8) {
         vstore8(CONVERT_FLOAT8(out3), 0, output + output_offset + stride + stride + stride);
     } else {
         FLOAT8 value = CONVERT_FLOAT8(out3);
-        for (int i = 0; i < channel_count; ++i) output[output_offset + stride + stride + stride + i] = value[i];
+        FLOAT scratch[8];
+        vstore8(value, 0, scratch);
+        for (int i = 0; i < channel_count; ++i) output[output_offset + stride + stride + stride + i] = scratch[i];
     }
 #endif
 }
@@ -961,7 +981,9 @@ __kernel void matmul_qkv_decode_b8(GLOBAL_SIZE_2_DIMS
         vstore8(CONVERT_FLOAT8(out0), 0, output + output_offset);
     } else {
         FLOAT8 value = CONVERT_FLOAT8(out0);
-        for (int i = 0; i < channel_count; ++i) output[output_offset + i] = value[i];
+        FLOAT scratch[8];
+        vstore8(value, 0, scratch);
+        for (int i = 0; i < channel_count; ++i) output[output_offset + i] = scratch[i];
     }
 #endif
 }
@@ -1046,7 +1068,9 @@ __kernel void matmul_qkv_decode_b4(GLOBAL_SIZE_2_DIMS
         vstore4(CONVERT_FLOAT4(out0), 0, output + output_offset);
     } else {
         FLOAT4 value = CONVERT_FLOAT4(out0);
-        for (int i = 0; i < channel_count; ++i) output[output_offset + i] = value[i];
+        FLOAT scratch[4];
+        vstore4(value, 0, scratch);
+        for (int i = 0; i < channel_count; ++i) output[output_offset + i] = scratch[i];
     }
 #endif
 }

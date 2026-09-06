@@ -34,6 +34,7 @@ class PowerSampler(context: Context) {
     private var executor: ScheduledExecutorService? = null
     private var startTimeMs: Long = 0L
     private var chargeAtStartUah: Long = Long.MIN_VALUE
+    private var loggedUnitInterpretation: Boolean = false
 
     fun start(intervalMs: Long = 100) {
         stop()
@@ -67,6 +68,7 @@ class PowerSampler(context: Context) {
         samplesUa.clear()
         startTimeMs = 0L
         chargeAtStartUah = Long.MIN_VALUE
+        loggedUnitInterpretation = false
     }
 
     /**
@@ -89,16 +91,51 @@ class PowerSampler(context: Context) {
     private fun readCurrentUa(): Long {
         val apiVal = batteryManager.getLongProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW)
         if (apiVal != Long.MIN_VALUE) {
-            return abs(apiVal)
+            return normalizeToUa(apiVal, "BatteryManager.BATTERY_PROPERTY_CURRENT_NOW")
         }
         for (path in CURRENT_SYSFS_PATHS) {
             try {
-                return abs(File(path).readText().trim().toLong())
+                val raw = File(path).readText().trim().toLong()
+                return normalizeToUa(raw, "sysfs:$path")
             } catch (e: Exception) {
                 // try next path
             }
         }
         return Long.MIN_VALUE
+    }
+
+    /**
+     * Both [BatteryManager.BATTERY_PROPERTY_CURRENT_NOW] and the sysfs
+     * current_now paths are documented/conventionally microamps, but at
+     * least one real device (OnePlus 8 Pro, post-Android-13-update) has been
+     * confirmed to report already-milliamps instead - raw values in the
+     * 100-300 range under active inference load, vs. the ~100,000-300,000
+     * range genuine microamps would show. Dividing an already-mA value by
+     * 1000.0 again (as [getAverageMa] does, assuming microamps) silently
+     * produces a ~1000x-undercounted result (e.g. 0.21 mA instead of ~210 mA)
+     * with no error - confirmed via POWER_DEBUG_RAW logging against
+     * `adb shell dumpsys battery`'s own mA-scale reading on that device.
+     *
+     * A real microamp reading under active load is never this small, so
+     * magnitude alone reliably distinguishes the two: below the threshold,
+     * treat the raw value as already-mA and scale up to the microamp-
+     * equivalent this class's downstream math (getAverageMa()'s /1000.0,
+     * the charge-counter-delta fallback) already assumes throughout -
+     * normalizing here, once, keeps every other unit-comfortable rather
+     * than threading a "already converted" flag through the whole class.
+     */
+    private fun normalizeToUa(raw: Long, source: String): Long {
+        val magnitude = abs(raw)
+        val alreadyMa = magnitude < MA_VS_UA_THRESHOLD
+        if (!loggedUnitInterpretation) {
+            loggedUnitInterpretation = true
+            Log.i(
+                TAG,
+                "POWER_UNIT_INTERPRETATION source=$source rawSample=$raw interpretedAs=" +
+                    if (alreadyMa) "milliamps (already-mA workaround applied, scaled x1000)" else "microamps (standard)"
+            )
+        }
+        return if (alreadyMa) magnitude * 1000L else magnitude
     }
 
     private fun computeAvgCurrentUa(
@@ -128,6 +165,11 @@ class PowerSampler(context: Context) {
 
     companion object {
         private const val TAG = "PowerSampler"
+        // Below this raw magnitude, treat BATTERY_PROPERTY_CURRENT_NOW (or the
+        // sysfs current_now fallback) as already-milliamps rather than the
+        // documented microamps - see normalizeToUa()'s kdoc for how this was
+        // confirmed on a real device.
+        private const val MA_VS_UA_THRESHOLD = 10_000L
         private val CURRENT_SYSFS_PATHS = listOf(
             "/sys/class/power_supply/battery/current_now",
             "/sys/class/power_supply/Battery/current_now",
