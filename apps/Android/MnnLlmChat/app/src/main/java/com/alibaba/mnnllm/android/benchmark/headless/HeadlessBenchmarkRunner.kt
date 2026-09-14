@@ -204,6 +204,8 @@ class HeadlessBenchmarkRunner(private val context: Context) {
 
             val peakRssKb = MemoryMonitor.getMaxMemoryPssKb()
             val avgPowerMa = powerSampler.getAverageMa()
+            val energyMasSampled = powerSampler.getEnergyMasSampled()
+            val energyMjSampled = powerSampler.getEnergyMjSampled()
             val cpuTempC = thermalSampler.getMaxCpuTempC()
             val skinTempC = thermalSampler.getMaxSkinTempC()
             val thermalStatus = thermalSampler.getThermalStatusLabel()
@@ -216,6 +218,8 @@ class HeadlessBenchmarkRunner(private val context: Context) {
             Log.i(LOG_TAG, "run_id=$runId DECODE_LEN=$decodeLen")
             Log.i(LOG_TAG, "run_id=$runId PEAK_RSS_KB=$peakRssKb")
             Log.i(LOG_TAG, "run_id=$runId POWER_MA=${avgPowerMa?.let { "%.2f".format(it) } ?: "unavailable"}")
+            Log.i(LOG_TAG, "run_id=$runId ENERGY_MAS_SAMPLED=${energyMasSampled?.let { "%.3f".format(it) } ?: "unavailable"}")
+            Log.i(LOG_TAG, "run_id=$runId ENERGY_MJ_SAMPLED=${energyMjSampled?.let { "%.3f".format(it) } ?: "unavailable"}")
             Log.i(LOG_TAG, "run_id=$runId THERMAL_STATUS=$thermalStatus")
             Log.i(LOG_TAG, "run_id=$runId THERMAL_TEMP_CPU_C=${cpuTempC?.let { "%.1f".format(it) } ?: "unavailable"}")
             Log.i(LOG_TAG, "run_id=$runId THERMAL_TEMP_SKIN_C=${skinTempC?.let { "%.1f".format(it) } ?: "unavailable"}")

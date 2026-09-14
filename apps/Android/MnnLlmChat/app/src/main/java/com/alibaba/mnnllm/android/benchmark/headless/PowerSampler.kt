@@ -1,6 +1,8 @@
 package com.alibaba.mnnllm.android.benchmark.headless
 
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.os.BatteryManager
 import android.util.Log
 import java.io.File
@@ -9,6 +11,22 @@ import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 import kotlin.math.abs
+
+/**
+ * One instantaneous current (and, when available, voltage) reading paired
+ * with the real wall-clock time it was taken, rather than an index into a
+ * nominally-fixed-interval list - scheduleAtFixedRate() targets [intervalMs]
+ * but genuine drift (GC pauses, scheduler contention under the exact
+ * CPU/GPU-heavy load this class exists to measure) means consecutive
+ * samples are not reliably exactly 100ms apart. Recording the real
+ * timestamp per sample lets energy integration use the actual elapsed time
+ * between each pair of samples instead of assuming perfect spacing.
+ *
+ * [voltageMv] is nullable independent of [currentUa] - see
+ * [PowerSampler.readVoltageMv]'s kdoc for why a voltage reading can be
+ * stale/unavailable on a tick where the current reading succeeds fine.
+ */
+data class PowerSample(val timestampMs: Long, val currentUa: Long, val voltageMv: Long?)
 
 /**
  * Samples battery current during inference and reports the average in mA.
@@ -25,20 +43,46 @@ import kotlin.math.abs
  *      readings from either of the above, fall back to a charge-counter
  *      delta: total charge drained ([BatteryManager.BATTERY_PROPERTY_CHARGE_COUNTER])
  *      over the elapsed duration, converted to an equivalent average current.
+ *
+ * Also exposes two independent energy figures alongside the average:
+ * [getEnergyMasSampled] (mA·s, trapezoidal integration over real per-sample
+ * current-only timestamps - a charge-equivalent quantity, not true energy,
+ * since it implicitly assumes constant voltage) and [getEnergyMjSampled]
+ * (mJ, the same trapezoidal integration but over current x voltage at each
+ * sample - true energy, accounting for real per-sample voltage rather than
+ * assuming it constant). A third method based on the hardware charge-counter
+ * delta was considered and removed: every real benchmark run here is
+ * USB-connected for ADB, and charging current contaminates a charge-delta
+ * measurement with no way to separate it back out - fundamentally unreliable
+ * in this project's actual setup, not just a rare edge case. (A fourth
+ * option, BatteryManager.BATTERY_PROPERTY_ENERGY_COUNTER - a direct
+ * fuel-gauge energy reading - was also evaluated and confirmed unsupported,
+ * returning the Long.MIN_VALUE sentinel, on both real test devices used for
+ * this project: a OnePlus 8 Pro and a Galaxy S23.)
  */
 class PowerSampler(context: Context) {
 
+    private val appContext = context.applicationContext
     private val batteryManager =
-        context.applicationContext.getSystemService(Context.BATTERY_SERVICE) as BatteryManager
-    private val samplesUa = ConcurrentLinkedQueue<Long>()
+        appContext.getSystemService(Context.BATTERY_SERVICE) as BatteryManager
+    private val batteryChangedFilter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
+    private val samples = ConcurrentLinkedQueue<PowerSample>()
     private var executor: ScheduledExecutorService? = null
     private var startTimeMs: Long = 0L
+    private var stopTimeMs: Long = 0L
+    // Used only by getAverageMa()'s own internal fallback (computeAvgCurrentUa())
+    // when instantaneous sampling produced zero valid readings - NOT used for
+    // energy: a charge-counter-based energy method was considered and
+    // removed (see this class's own kdoc above) since every real benchmark
+    // run here is USB-connected for ADB, and charging current contaminates a
+    // charge-delta measurement with no fallback to fall back on.
     private var chargeAtStartUah: Long = Long.MIN_VALUE
     private var loggedUnitInterpretation: Boolean = false
 
     fun start(intervalMs: Long = 100) {
         stop()
         startTimeMs = System.currentTimeMillis()
+        stopTimeMs = 0L
         chargeAtStartUah = try {
             batteryManager.getLongProperty(BatteryManager.BATTERY_PROPERTY_CHARGE_COUNTER)
         } catch (e: Exception) {
@@ -50,7 +94,13 @@ class PowerSampler(context: Context) {
             try {
                 val sample = readCurrentUa()
                 if (sample > 0L) {
-                    samplesUa.add(sample)
+                    // Voltage is sampled at the SAME cadence as current, on
+                    // the same tick - not a separate slower poll - so every
+                    // PowerSample carries whatever voltage reading was
+                    // available at that same instant, even though (see
+                    // readVoltageMv()'s kdoc) the underlying value itself
+                    // may not have actually changed since the last tick.
+                    samples.add(PowerSample(System.currentTimeMillis(), sample, readVoltageMv()))
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "power sample failed: ${e.message}")
@@ -61,12 +111,20 @@ class PowerSampler(context: Context) {
     fun stop() {
         executor?.shutdownNow()
         executor = null
+        // Guarded so a stray extra stop() call (reset() calls stop(), and
+        // callers may also stop() directly beforehand) never overwrites a
+        // real stop timestamp with a later one - only the FIRST stop() after
+        // a start() records it.
+        if (stopTimeMs == 0L && startTimeMs != 0L) {
+            stopTimeMs = System.currentTimeMillis()
+        }
     }
 
     fun reset() {
         stop()
-        samplesUa.clear()
+        samples.clear()
         startTimeMs = 0L
+        stopTimeMs = 0L
         chargeAtStartUah = Long.MIN_VALUE
         loggedUnitInterpretation = false
     }
@@ -77,9 +135,67 @@ class PowerSampler(context: Context) {
      * since [start]. Null if neither produced a usable value.
      */
     fun getAverageMa(): Double? {
-        val durationSecs = ((System.currentTimeMillis() - startTimeMs) / 1000L).toInt()
-        val avgUa = computeAvgCurrentUa(samplesUa.toList(), chargeAtStartUah, durationSecs)
+        val endMs = if (stopTimeMs != 0L) stopTimeMs else System.currentTimeMillis()
+        val durationSecs = ((endMs - startTimeMs) / 1000L).toInt()
+        val avgUa = computeAvgCurrentUa(samples.map { it.currentUa }, chargeAtStartUah, durationSecs)
         return if (avgUa == Long.MIN_VALUE) null else avgUa / 1000.0
+    }
+
+    /**
+     * CHARGE-equivalent quantity in mA·s via trapezoidal integration
+     * (Σ (i1+i2)/2 · Δt) over the real per-sample timestamps recorded during
+     * [start]/[stop] - not an assumed-even-spacing approximation. This is
+     * current integrated over time (i.e. charge, mA·s = mC-ish scaling), NOT
+     * true energy - it implicitly assumes constant voltage throughout the
+     * window. Use [getEnergyMjSampled] for true energy (accounts for real
+     * per-sample voltage instead of assuming it constant). Null when fewer
+     * than 2 valid samples exist (nothing to integrate between).
+     */
+    fun getEnergyMasSampled(): Double? {
+        val ordered = samples.toList().sortedBy { it.timestampMs }
+        if (ordered.size < 2) return null
+        var energyUaMs = 0.0
+        for (i in 1 until ordered.size) {
+            val dtMs = (ordered[i].timestampMs - ordered[i - 1].timestampMs).toDouble()
+            if (dtMs <= 0) continue // clock oddity guard; never expected in practice
+            val avgUa = (ordered[i].currentUa + ordered[i - 1].currentUa) / 2.0
+            energyUaMs += avgUa * dtMs
+        }
+        // uA * ms -> mA * s is /1000 (uA -> mA) then /1000 (ms -> s) = /1_000_000.
+        return energyUaMs / 1_000_000.0
+    }
+
+    /**
+     * TRUE energy in millijoules via trapezoidal integration over
+     * current x voltage at each sample (Σ (i1·v1 + i2·v2)/2 · Δt), using the
+     * real per-sample timestamps - Energy = ∫ Power dt = ∫ I·V dt, not the
+     * constant-voltage approximation [getEnergyMasSampled] makes. Only pairs
+     * where BOTH samples have a voltage reading are integrated (a tick
+     * where the concurrent voltage read failed is simply skipped, same
+     * real-timestamp-of-the-surviving-pair logic as elsewhere in this
+     * class) - see [readVoltageMv]'s kdoc for the real accuracy caveat this
+     * still carries even so. Null when fewer than 2 samples have a paired
+     * voltage reading.
+     *
+     * Unit derivation: currentUa (µA) x voltageMv (mV) x dtMs (ms) is in
+     * µA·mV·ms = 1e-6 A · 1e-3 V · 1e-3 s = 1e-12 J = 1e-9 mJ, so the raw
+     * Σ i·v·dt accumulator is scaled by 1e-9 at the end (not per-term, to
+     * avoid needless floating-point precision loss across many small terms).
+     */
+    fun getEnergyMjSampled(): Double? {
+        val ordered = samples.toList()
+            .filter { it.voltageMv != null }
+            .sortedBy { it.timestampMs }
+        if (ordered.size < 2) return null
+        var energyRaw = 0.0 // accumulates in uA*mV*ms units - see kdoc above
+        for (i in 1 until ordered.size) {
+            val dtMs = (ordered[i].timestampMs - ordered[i - 1].timestampMs).toDouble()
+            if (dtMs <= 0) continue // clock oddity guard; never expected in practice
+            val power1 = ordered[i - 1].currentUa.toDouble() * ordered[i - 1].voltageMv!!.toDouble()
+            val power2 = ordered[i].currentUa.toDouble() * ordered[i].voltageMv!!.toDouble()
+            energyRaw += (power1 + power2) / 2.0 * dtMs
+        }
+        return energyRaw * 1e-9
     }
 
     /**
@@ -102,6 +218,44 @@ class PowerSampler(context: Context) {
             }
         }
         return Long.MIN_VALUE
+    }
+
+    /**
+     * Battery voltage in millivolts, or null if unavailable.
+     *
+     * BatteryManager.getLongProperty() has NO voltage property (only
+     * CAPACITY/CHARGE_COUNTER/CURRENT_NOW/CURRENT_AVERAGE/ENERGY_COUNTER/
+     * STATUS) - voltage is only exposed via the system's sticky
+     * ACTION_BATTERY_CHANGED broadcast's EXTRA_VOLTAGE extra. Passing a null
+     * receiver to registerReceiver() with that action just synchronously
+     * returns the last-delivered sticky Intent (no actual receiver is
+     * registered/leaked, no IPC round-trip beyond reading a cached value) -
+     * this is the standard, cheap way to poll current battery state
+     * on-demand, safe to call at the same 100ms cadence as [readCurrentUa].
+     *
+     * REAL ACCURACY CAVEAT: unlike CURRENT_NOW (a genuine instantaneous
+     * hardware reading each call), EXTRA_VOLTAGE only changes when the
+     * system actually dispatches a fresh ACTION_BATTERY_CHANGED broadcast -
+     * which Android rate-limits (typically on a percent-level change or
+     * roughly every 30-60s), NOT every 100ms. In practice this means most
+     * consecutive samples within one benchmark question will carry the
+     * IDENTICAL voltage value even though current is genuinely resampled
+     * each tick - true energy is still a meaningful improvement over
+     * assuming one constant voltage sitewide, but within a single short
+     * question it is closer to "the one voltage reading in effect during
+     * this window" than a genuinely continuously-resampled quantity. Voltage
+     * sag under real load (which DOES happen, especially under the sustained
+     * CPU/GPU draw this class measures) will be under-captured unless a
+     * benchmark question happens to span a broadcast update.
+     */
+    private fun readVoltageMv(): Long? {
+        return try {
+            val stickyIntent = appContext.registerReceiver(null, batteryChangedFilter)
+            val voltage = stickyIntent?.getIntExtra(BatteryManager.EXTRA_VOLTAGE, -1) ?: -1
+            if (voltage > 0) voltage.toLong() else null
+        } catch (e: Exception) {
+            null
+        }
     }
 
     /**
