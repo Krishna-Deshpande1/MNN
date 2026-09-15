@@ -123,12 +123,19 @@ class Attention(torch.nn.Module):
             f'/layers.{layer_id}/self_attn/FusedAttention', layer_id, kv_shared_idx,
             self.head_dim)
         self.rope_cut_head_dim = min(int(getattr(self.rotary, 'rotary_dim', self.head_dim)), self.head_dim)
+        # Gemma family (gemma/gemma2/gemma3/gemma3_text/gemma4) stores
+        # RMSNorm weight as (scale - 1); FusedRoPE's q_norm/k_norm export
+        # must add the 1.0 back since it reads norm.weight directly rather
+        # than tracing the norm's forward() (see FusedRoPE's own comment).
+        model_type = str(getattr(config, 'model_type', '') or '')
+        zero_centered_gamma = model_type.startswith('gemma')
         self.fused_rope = FusedRoPE(
             self.rope_cut_head_dim,
             self.num_heads,
             self.num_key_value_heads,
             self.head_dim,
             f'/layers.{layer_id}/self_attn/FusedRoPE',
+            zero_centered_gamma=zero_centered_gamma,
         )
 
         if hasattr(self, 'qkv_proj') and self.qkv_proj is not None:

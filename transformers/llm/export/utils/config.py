@@ -22,7 +22,14 @@ class LlmConfig(PretrainedConfig):
         self.sliding_window = self.sliding_window if self.sliding_window is not None else 0
         self.layer_types = kwargs.pop("layer_types", [])
         self.attention_type = kwargs.pop("attention_type", 'full')
-        self.tie_word_embeddings = kwargs.pop("tie_word_embeddings", False)
+        # HuggingFace's PretrainedConfig defaults tie_word_embeddings to True
+        # when the field is absent from config.json (e.g. Gemma3-270m's
+        # config.json omits it entirely, relying on that default). Match that
+        # default here instead of silently treating an absent field as
+        # untied, which skips the lm_head/embedding weight-storage dedup in
+        # mnn_converter.py for any model whose config.json doesn't set this
+        # explicitly.
+        self.tie_word_embeddings = kwargs.pop("tie_word_embeddings", True)
         self.scale_emb = kwargs.pop("scale_emb", None)
         self.conv_L_cache = kwargs.pop("conv_L_cache", 0)
         self.rope_parameters = kwargs.pop("rope_parameters", None)

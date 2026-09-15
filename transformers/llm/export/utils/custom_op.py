@@ -110,13 +110,22 @@ class FusedRoPEOp(torch.autograd.Function):
         return query, key
 
 class FusedRoPE(torch.nn.Module):
-    def __init__(self, rope_cut_head_dim, num_head, kv_num_head, head_dim, name):
+    def __init__(self, rope_cut_head_dim, num_head, kv_num_head, head_dim, name, zero_centered_gamma=False):
         super(FusedRoPE, self).__init__()
         self.rope_cut_head_dim = int(rope_cut_head_dim)
         self.num_head = int(num_head)
         self.kv_num_head = int(kv_num_head)
         self.head_dim = int(head_dim)
         self.name = name
+        # Gemma-family RMSNorm (q_norm/k_norm included) stores weight as
+        # (scale - 1) and applies scale = 1.0 + weight in its forward() -
+        # see e.g. HF's Gemma3RMSNorm. The standalone LayerNorm export path
+        # (input_layernorm etc.) picks this up automatically because it
+        # traces the norm's actual forward() into the ONNX graph. This
+        # fused path reads norm.weight directly in Python instead of
+        # tracing forward(), so it must replicate that +1.0 explicitly or
+        # it silently exports the wrong (too-small-by-1-per-channel) scale.
+        self.zero_centered_gamma = bool(zero_centered_gamma)
 
     @staticmethod
     def norm_eps(norm):
@@ -127,6 +136,11 @@ class FusedRoPE(torch.nn.Module):
     def forward(self, query, key, cos, sin, q_norm=None, k_norm=None):
         q_norm_weight = query.new_empty((0,)) if q_norm is None else q_norm.weight
         k_norm_weight = key.new_empty((0,)) if k_norm is None else k_norm.weight
+        if self.zero_centered_gamma:
+            if q_norm is not None:
+                q_norm_weight = q_norm_weight + 1.0
+            if k_norm is not None:
+                k_norm_weight = k_norm_weight + 1.0
         q_norm_eps = 0.0 if q_norm is None else self.norm_eps(q_norm)
         k_norm_eps = 0.0 if k_norm is None else self.norm_eps(k_norm)
         return FusedRoPEOp.apply(

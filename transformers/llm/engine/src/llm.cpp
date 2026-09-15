@@ -11,6 +11,8 @@
 #include <sstream>
 #include <iomanip>
 #include <unordered_set>
+#include <limits>
+#include <algorithm>
 #ifdef __ANDROID__
 #include <android/log.h>
 #endif
