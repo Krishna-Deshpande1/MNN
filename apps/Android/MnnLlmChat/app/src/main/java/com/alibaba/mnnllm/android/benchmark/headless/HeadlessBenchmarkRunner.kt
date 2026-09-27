@@ -11,8 +11,10 @@ import java.io.File
 import java.util.concurrent.atomic.AtomicLong
 
 /**
- * Runs a single, fully-isolated headless inference request and logs
- * TTFT/prefill/decode/RSS/power/thermal metrics tagged by run_id to Logcat.
+ * Runs one or more headless inference requests against a SINGLE loaded
+ * [LlmSession] and logs TTFT/prefill/decode/RSS/power/thermal metrics per
+ * generation, tagged by run_id (or, for a multi-generation sweep, by a
+ * per-generation sub run_id) to Logcat.
  *
  * Deliberately does NOT go through
  * [com.alibaba.mnnllm.api.openai.runtime.LlmRuntimeController]'s cached
@@ -21,6 +23,22 @@ import java.util.concurrent.atomic.AtomicLong
  * released - so that a peak-RSS reading for one model file is never
  * contaminated by a larger model left resident from a previous headless or
  * chat-UI session in the same process.
+ *
+ * [warmupRuns]/[trials] (both default to the original single-shot
+ * behavior: 0 warmups, 1 trial) let a single broadcast run an entire
+ * warmup+trials sweep against ONE loaded session instead of a fresh
+ * session per generation. This matters specifically for GPU backends:
+ * OpenCL kernels are JIT-compiled by the driver lazily, on the first
+ * actual forward pass through each op/shape - not at load() time - and
+ * that compile cost is amortized only across calls that share the same
+ * live session/runtime. A fresh LlmSession per trial (the original
+ * design, still what [warmupRuns]=0,[trials]=1 gives you per broadcast)
+ * pays that cold-compile cost on literally every single trial, including
+ * the "warmup" one, which is indistinguishable from every other
+ * catastrophically-slow trial. Looping generations inside one session
+ * instead matches the paper methodology this harness is trying to
+ * reproduce ("one warm-up run followed by at least three recorded
+ * trials") and lets a real warmup actually warm something up.
  */
 class HeadlessBenchmarkRunner(private val context: Context) {
 
@@ -32,7 +50,9 @@ class HeadlessBenchmarkRunner(private val context: Context) {
         topK: Int? = null,
         topP: Float? = null,
         minP: Float? = null,
-        backendType: String? = null
+        backendType: String? = null,
+        warmupRuns: Int = 0,
+        trials: Int = 1
     ) {
         val powerSampler = PowerSampler(context)
         val thermalSampler = ThermalSampler(context)
@@ -49,8 +69,10 @@ class HeadlessBenchmarkRunner(private val context: Context) {
             // model the user has loaded through the normal chat UI.
             val modelId = "headless/$modelPath"
 
-            // RSS is tracked across the full call - load through generation -
-            // since model load is frequently where peak RSS actually occurs.
+            // RSS is tracked across the full call - load through every
+            // generation in this sweep - since model load is frequently
+            // where peak RSS actually occurs, and the peak only ever grows
+            // monotonically across a sweep of same-model generations.
             MemoryMonitor.reset()
             MemoryMonitor.start(intervalSeconds = 1)
 
@@ -69,6 +91,7 @@ class HeadlessBenchmarkRunner(private val context: Context) {
                 "SAMPLER_OVERRIDE_TOP_P=${topP ?: "default"} SAMPLER_OVERRIDE_MIN_P=${minP ?: "default"}")
 
             Log.i(LOG_TAG, "run_id=$runId BACKEND_TYPE_OVERRIDE=${backendType ?: "default"}")
+            Log.i(LOG_TAG, "run_id=$runId SWEEP_CONFIG warmup_runs=$warmupRuns trials=$trials")
             val coldLoadStartMs = System.currentTimeMillis()
             val newSession = ChatService.provide().createLlmSession(
                 modelId,
@@ -88,7 +111,11 @@ class HeadlessBenchmarkRunner(private val context: Context) {
             // setting it explicitly (and before load, since it feeds the
             // native extra_config at construction time) means correctness
             // here never depends on some other default staying what it is
-            // today.
+            // today. keep_history=false also makes every generation below
+            // start from the same clean single-turn state (see Response()
+            // in llm_session.cpp: history_.resize(1) when !keep_history_),
+            // so looping multiple generations in one session never grows
+            // the effective prompt across trials.
             newSession.setKeepHistory(false)
             newSession.load()
             val coldLoadMs = System.currentTimeMillis() - coldLoadStartMs
@@ -128,102 +155,25 @@ class HeadlessBenchmarkRunner(private val context: Context) {
             newSession.updateMaxNewTokens(maxTokens)
             Log.i(LOG_TAG, "run_id=$runId MAX_TOKENS=$maxTokens")
 
-            val ttftCapturedNanos = AtomicLong(-1)
-            val requestStartNanos = System.nanoTime()
-            val responseBuilder = StringBuilder()
-
-            // Power/thermal are sampled only across the inference window
-            // itself (not model load), per spec.
-            powerSampler.start(intervalMs = 100)
-            thermalSampler.start(intervalMs = 1000)
-
-            // TEMPORARY: RESPDEBUG logs every onProgress invocation, same
-            // style as the earlier blank-response investigation (that one
-            // was root-caused to an embedded-newline logcat artifact, fixed
-            // by escapeForSingleLineLog() on RUN_DONE). Re-added because the
-            // same 100%-blank symptom is now showing on Qwen3.5-2B, which
-            // uses a different response format ("Thinking Process:" plain
-            // text instead of <think></think>) - this may be a distinct
-            // root cause. Remove once confirmed and fixed.
-            var respDebugCallCount = 0
-            val result = newSession.generate(prompt, emptyMap(), object : GenerateProgressListener {
-                override fun onProgress(progress: String?): Boolean {
-                    respDebugCallCount++
-                    val lengthBefore = responseBuilder.length
-                    if (progress != null) {
-                        // Wall-clock TTFT: time from submit to the first
-                        // actual streamed token, captured in Kotlin. This is
-                        // intentionally separate from the native prefill_time
-                        // below - it also captures JNI dispatch/scheduling
-                        // overhead that native compute time alone misses.
-                        ttftCapturedNanos.compareAndSet(-1L, System.nanoTime() - requestStartNanos)
-                        responseBuilder.append(progress)
-                    }
-                    Log.i(
-                        "RESPDEBUG",
-                        "run_id=$runId onProgress call #$respDebugCallCount raw_chunk=${
-                            progress?.let { "\"${escapeForSingleLineLog(it)}\"" } ?: "null"
-                        } chunkLength=${progress?.length ?: 0} responseBuilderLengthBefore=$lengthBefore " +
-                            "responseBuilderLengthAfter=${responseBuilder.length} thread=${Thread.currentThread().name} " +
-                            "ts=${System.currentTimeMillis()}"
-                    )
-                    if (progress != null) {
-                        // Additional safety net alongside the token cap above:
-                        // a stuck model can loop on the same short substring
-                        // (observed: "...\n\n\n" repeating) well before
-                        // max_tokens is even reached. Returning true here
-                        // requests early stop the same way user-cancel does -
-                        // generation halts cleanly and whatever was decoded
-                        // so far is still returned normally below.
-                        if (hasRepeatingTail(responseBuilder, REPEAT_WINDOW_CHARS, REPEAT_MIN_REPEATS, runId)) {
-                            Log.i(
-                                LOG_TAG,
-                                "run_id=$runId REPETITION_DETECTED stopping early responseLength=${responseBuilder.length}"
-                            )
-                            return true
-                        }
-                    }
-                    return false // never request early stop otherwise for a benchmark run
-                }
-            })
-            Log.i(
-                "RESPDEBUG",
-                "run_id=$runId onProgress total calls=$respDebugCallCount final responseBuilder length=${responseBuilder.length} " +
-                    "content=\"${escapeForSingleLineLog(responseBuilder.toString())}\""
-            )
-
-            powerSampler.stop()
-            thermalSampler.stop()
-            MemoryMonitor.stop()
-
-            val ttftMs = if (ttftCapturedNanos.get() >= 0) ttftCapturedNanos.get() / 1_000_000.0 else -1.0
-            val promptLen = result["prompt_len"] as? Long ?: 0L
-            val decodeLen = result["decode_len"] as? Long ?: 0L
-            val prefillTimeUs = result["prefill_time"] as? Long ?: 0L
-            val decodeTimeUs = result["decode_time"] as? Long ?: 0L
-
-            val peakRssKb = MemoryMonitor.getMaxMemoryPssKb()
-            val avgPowerMa = powerSampler.getAverageMa()
-            val energyMasSampled = powerSampler.getEnergyMasSampled()
-            val energyMjSampled = powerSampler.getEnergyMjSampled()
-            val cpuTempC = thermalSampler.getMaxCpuTempC()
-            val skinTempC = thermalSampler.getMaxSkinTempC()
-            val thermalStatus = thermalSampler.getThermalStatusLabel()
-
-            Log.i(LOG_TAG, "run_id=$runId COLD_LOAD_MS=$coldLoadMs")
-            Log.i(LOG_TAG, "run_id=$runId TTFT_MS=$ttftMs")
-            Log.i(LOG_TAG, "run_id=$runId PREFILL_TIME_US=$prefillTimeUs")
-            Log.i(LOG_TAG, "run_id=$runId DECODE_TIME_US=$decodeTimeUs")
-            Log.i(LOG_TAG, "run_id=$runId PROMPT_LEN=$promptLen")
-            Log.i(LOG_TAG, "run_id=$runId DECODE_LEN=$decodeLen")
-            Log.i(LOG_TAG, "run_id=$runId PEAK_RSS_KB=$peakRssKb")
-            Log.i(LOG_TAG, "run_id=$runId POWER_MA=${avgPowerMa?.let { "%.2f".format(it) } ?: "unavailable"}")
-            Log.i(LOG_TAG, "run_id=$runId ENERGY_MAS_SAMPLED=${energyMasSampled?.let { "%.3f".format(it) } ?: "unavailable"}")
-            Log.i(LOG_TAG, "run_id=$runId ENERGY_MJ_SAMPLED=${energyMjSampled?.let { "%.3f".format(it) } ?: "unavailable"}")
-            Log.i(LOG_TAG, "run_id=$runId THERMAL_STATUS=$thermalStatus")
-            Log.i(LOG_TAG, "run_id=$runId THERMAL_TEMP_CPU_C=${cpuTempC?.let { "%.1f".format(it) } ?: "unavailable"}")
-            Log.i(LOG_TAG, "run_id=$runId THERMAL_TEMP_SKIN_C=${skinTempC?.let { "%.1f".format(it) } ?: "unavailable"}")
-            Log.i(LOG_TAG, "run_id=$runId RUN_DONE response=${escapeForSingleLineLog(responseBuilder.toString())}")
+            var isFirstGeneration = true
+            for (w in 1..warmupRuns) {
+                val subRunId = "${runId}_w$w"
+                Log.i(LOG_TAG, "run_id=$runId SWEEP_STEP phase=warmup index=$w sub_run_id=$subRunId")
+                runOneGeneration(
+                    newSession, prompt, subRunId, powerSampler, thermalSampler,
+                    coldLoadMs = if (isFirstGeneration) coldLoadMs else null
+                )
+                isFirstGeneration = false
+            }
+            for (t in 1..trials) {
+                val subRunId = "${runId}_t$t"
+                Log.i(LOG_TAG, "run_id=$runId SWEEP_STEP phase=trial index=$t sub_run_id=$subRunId")
+                runOneGeneration(
+                    newSession, prompt, subRunId, powerSampler, thermalSampler,
+                    coldLoadMs = if (isFirstGeneration) coldLoadMs else null
+                )
+                isFirstGeneration = false
+            }
         } catch (e: Exception) {
             Log.e(LOG_TAG, "run_id=$runId unhandled exception", e)
             logError(runId, "exception", e.message ?: e.toString())
@@ -232,14 +182,138 @@ class HeadlessBenchmarkRunner(private val context: Context) {
             thermalSampler.stop()
             MemoryMonitor.stop()
             // Always fully release - never leave this session cached for
-            // reuse. Reuse across different model files is exactly what
-            // would contaminate the next run's peak-RSS reading.
+            // reuse. Reuse across different model files (or across a
+            // process's separate headless calls) is exactly what would
+            // contaminate the next run's peak-RSS reading; reuse WITHIN one
+            // sweep's own warmup+trials loop above is fine since it's
+            // always the same model/backend/config for the whole sweep.
             try {
                 session?.release()
             } catch (e: Exception) {
                 Log.w(LOG_TAG, "run_id=$runId failed to release session: ${e.message}")
             }
         }
+    }
+
+    /**
+     * Runs exactly one generation against an already-loaded [session] and
+     * logs the same COLD_LOAD_MS/TTFT_MS/.../RUN_DONE tag lines the original
+     * single-shot run() always logged - just under [subRunId] instead of
+     * the sweep's outer run_id, so run_mnn_autobench.py's existing
+     * run_id-substring log parsing (parse_run()/tag_of(), unchanged) can
+     * pull out each generation's block independently from one shared
+     * logcat capture. [coldLoadMs] is only non-null for the very first
+     * generation in a sweep (the only one a real load() preceded); passing
+     * null omits COLD_LOAD_MS entirely for every later generation, which
+     * Python already treats as "not reported" (see build_metrics()) rather
+     * than a misleading 0ms reload.
+     */
+    private fun runOneGeneration(
+        session: LlmSession,
+        prompt: String,
+        subRunId: String,
+        powerSampler: PowerSampler,
+        thermalSampler: ThermalSampler,
+        coldLoadMs: Long?
+    ) {
+        val ttftCapturedNanos = AtomicLong(-1)
+        val requestStartNanos = System.nanoTime()
+        val responseBuilder = StringBuilder()
+
+        // Power/thermal are sampled only across the inference window itself
+        // (not model load), per spec - restarted fresh for every generation
+        // in the sweep so each trial gets its own independent reading.
+        powerSampler.start(intervalMs = 100)
+        thermalSampler.start(intervalMs = 1000)
+
+        // TEMPORARY: RESPDEBUG logs every onProgress invocation, same
+        // style as the earlier blank-response investigation (that one
+        // was root-caused to an embedded-newline logcat artifact, fixed
+        // by escapeForSingleLineLog() on RUN_DONE). Re-added because the
+        // same 100%-blank symptom is now showing on Qwen3.5-2B, which
+        // uses a different response format ("Thinking Process:" plain
+        // text instead of <think></think>) - this may be a distinct
+        // root cause. Remove once confirmed and fixed.
+        var respDebugCallCount = 0
+        val result = session.generate(prompt, emptyMap(), object : GenerateProgressListener {
+            override fun onProgress(progress: String?): Boolean {
+                respDebugCallCount++
+                val lengthBefore = responseBuilder.length
+                if (progress != null) {
+                    // Wall-clock TTFT: time from submit to the first
+                    // actual streamed token, captured in Kotlin. This is
+                    // intentionally separate from the native prefill_time
+                    // below - it also captures JNI dispatch/scheduling
+                    // overhead that native compute time alone misses.
+                    ttftCapturedNanos.compareAndSet(-1L, System.nanoTime() - requestStartNanos)
+                    responseBuilder.append(progress)
+                }
+                Log.i(
+                    "RESPDEBUG",
+                    "run_id=$subRunId onProgress call #$respDebugCallCount raw_chunk=${
+                        progress?.let { "\"${escapeForSingleLineLog(it)}\"" } ?: "null"
+                    } chunkLength=${progress?.length ?: 0} responseBuilderLengthBefore=$lengthBefore " +
+                        "responseBuilderLengthAfter=${responseBuilder.length} thread=${Thread.currentThread().name} " +
+                        "ts=${System.currentTimeMillis()}"
+                )
+                if (progress != null) {
+                    // Additional safety net alongside the token cap above:
+                    // a stuck model can loop on the same short substring
+                    // (observed: "...\n\n\n" repeating) well before
+                    // max_tokens is even reached. Returning true here
+                    // requests early stop the same way user-cancel does -
+                    // generation halts cleanly and whatever was decoded
+                    // so far is still returned normally below.
+                    if (hasRepeatingTail(responseBuilder, REPEAT_WINDOW_CHARS, REPEAT_MIN_REPEATS, subRunId)) {
+                        Log.i(
+                            LOG_TAG,
+                            "run_id=$subRunId REPETITION_DETECTED stopping early responseLength=${responseBuilder.length}"
+                        )
+                        return true
+                    }
+                }
+                return false // never request early stop otherwise for a benchmark run
+            }
+        })
+        Log.i(
+            "RESPDEBUG",
+            "run_id=$subRunId onProgress total calls=$respDebugCallCount final responseBuilder length=${responseBuilder.length} " +
+                "content=\"${escapeForSingleLineLog(responseBuilder.toString())}\""
+        )
+
+        powerSampler.stop()
+        thermalSampler.stop()
+
+        val ttftMs = if (ttftCapturedNanos.get() >= 0) ttftCapturedNanos.get() / 1_000_000.0 else -1.0
+        val promptLen = result["prompt_len"] as? Long ?: 0L
+        val decodeLen = result["decode_len"] as? Long ?: 0L
+        val prefillTimeUs = result["prefill_time"] as? Long ?: 0L
+        val decodeTimeUs = result["decode_time"] as? Long ?: 0L
+
+        val peakRssKb = MemoryMonitor.getMaxMemoryPssKb()
+        val avgPowerMa = powerSampler.getAverageMa()
+        val energyMasSampled = powerSampler.getEnergyMasSampled()
+        val energyMjSampled = powerSampler.getEnergyMjSampled()
+        val cpuTempC = thermalSampler.getMaxCpuTempC()
+        val skinTempC = thermalSampler.getMaxSkinTempC()
+        val thermalStatus = thermalSampler.getThermalStatusLabel()
+
+        if (coldLoadMs != null) {
+            Log.i(LOG_TAG, "run_id=$subRunId COLD_LOAD_MS=$coldLoadMs")
+        }
+        Log.i(LOG_TAG, "run_id=$subRunId TTFT_MS=$ttftMs")
+        Log.i(LOG_TAG, "run_id=$subRunId PREFILL_TIME_US=$prefillTimeUs")
+        Log.i(LOG_TAG, "run_id=$subRunId DECODE_TIME_US=$decodeTimeUs")
+        Log.i(LOG_TAG, "run_id=$subRunId PROMPT_LEN=$promptLen")
+        Log.i(LOG_TAG, "run_id=$subRunId DECODE_LEN=$decodeLen")
+        Log.i(LOG_TAG, "run_id=$subRunId PEAK_RSS_KB=$peakRssKb")
+        Log.i(LOG_TAG, "run_id=$subRunId POWER_MA=${avgPowerMa?.let { "%.2f".format(it) } ?: "unavailable"}")
+        Log.i(LOG_TAG, "run_id=$subRunId ENERGY_MAS_SAMPLED=${energyMasSampled?.let { "%.3f".format(it) } ?: "unavailable"}")
+        Log.i(LOG_TAG, "run_id=$subRunId ENERGY_MJ_SAMPLED=${energyMjSampled?.let { "%.3f".format(it) } ?: "unavailable"}")
+        Log.i(LOG_TAG, "run_id=$subRunId THERMAL_STATUS=$thermalStatus")
+        Log.i(LOG_TAG, "run_id=$subRunId THERMAL_TEMP_CPU_C=${cpuTempC?.let { "%.1f".format(it) } ?: "unavailable"}")
+        Log.i(LOG_TAG, "run_id=$subRunId THERMAL_TEMP_SKIN_C=${skinTempC?.let { "%.1f".format(it) } ?: "unavailable"}")
+        Log.i(LOG_TAG, "run_id=$subRunId RUN_DONE response=${escapeForSingleLineLog(responseBuilder.toString())}")
     }
 
     private fun logError(runId: String, reason: String, message: String) {

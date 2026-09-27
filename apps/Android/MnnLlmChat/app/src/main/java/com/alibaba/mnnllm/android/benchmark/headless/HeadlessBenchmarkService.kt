@@ -50,6 +50,8 @@ class HeadlessBenchmarkService : Service() {
             intent.getFloatExtra(BenchmarkHeadlessReceiver.EXTRA_MIN_P, 0f)
         } else null
         val backendType = intent?.getStringExtra(BenchmarkHeadlessReceiver.EXTRA_BACKEND_TYPE)
+        val warmupRuns = intent?.getIntExtra(BenchmarkHeadlessReceiver.EXTRA_WARMUP_RUNS, 0) ?: 0
+        val trials = intent?.getIntExtra(BenchmarkHeadlessReceiver.EXTRA_TRIALS, 1) ?: 1
 
         val notification = buildNotification(runId)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -69,7 +71,10 @@ class HeadlessBenchmarkService : Service() {
 
         serviceScope.launch {
             try {
-                HeadlessBenchmarkRunner(applicationContext).run(modelPath, prompt, runId, maxTokens, topK, topP, minP, backendType)
+                HeadlessBenchmarkRunner(applicationContext).run(
+                    modelPath, prompt, runId, maxTokens, topK, topP, minP, backendType,
+                    warmupRuns = warmupRuns, trials = trials
+                )
             } finally {
                 finishAndStop(startId)
             }

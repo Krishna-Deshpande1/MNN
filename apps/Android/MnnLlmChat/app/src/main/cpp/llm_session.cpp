@@ -246,6 +246,11 @@ bool LlmSession::Load() {
     llm_->set_config(config_str);
     MNN_DEBUG("dumped config: %s", llm_->dump_config().c_str());
     model_loaded_ = llm_->load();
+    if (model_loaded_ && current_config_.value("backend_type", "cpu") != "cpu") {
+        MNN_DEBUG("Running GPU kernel autotuning before first inference (backend=%s)",
+                   current_config_.value("backend_type", "cpu").c_str());
+        llm_->tuning(MNN::Transformer::OP_ENCODER_NUMBER, {1, 5, 10, 20, 30, 50, 100});
+    }
     if (!model_loaded_) {
         last_load_error_ = "Module load failed for config: " + model_path_ +
             ". Common causes: model file (.mnn) missing or corrupted, wrong backend (e.g. NPU on CPU-only device), insufficient memory.";
@@ -338,6 +343,25 @@ const MNN::Transformer::LlmContext * LlmSession::Response(const std::string &pro
     // Check for multimodal content in the full prompt
     auto multimodal_result = processMultimodalPrompt(full_prompt_text);
     restoreAndroidSteppingStatusIfNeeded(llm_);
+    // llm_->tuning() (called once in Load()) is a hard no-op for
+    // backend_type=="opencl": MNN::Transformer::Llm::tuning() early-returns
+    // unconditionally in that case (transformers/llm/engine/src/llm.cpp,
+    // "FIXME: Currently OpenCL Don't support KVMeta"). The mechanism the
+    // engine actually relies on for OpenCL performance is the
+    // OP_ENCODER_NUMBER_FOR_COMMIT hint, toggled via switchMode(): off (0)
+    // during prefill (sequence length changes every call, so recording a
+    // command queue for replay never pays off) and on/512 during decode
+    // (the single-token step shape repeats every iteration and benefits
+    // from being recorded once and replayed cheaply). llm_bench.cpp calls
+    // this manually around its own prefill/decode test calls (see
+    // tools/llm_bench.cpp ~line 1237-1282); nothing on this app's
+    // Response()/generate() path did until now, so every OpenCL call here
+    // ran fully un-recorded on every single prefill and decode step,
+    // regardless of Llm::tuning() ever running.
+    bool is_opencl_backend = current_config_.value("backend_type", "cpu") == "opencl";
+    if (is_opencl_backend) {
+        llm_->switchMode(MNN::Transformer::Llm::Prefill);
+    }
     if (multimodal_result.has_multimodal) {
         MNN_DEBUG("Detected multimodal content, using multimodal API prompt %s with %zu images",
              multimodal_result.multimodal_prompt.prompt_template.c_str(),
@@ -351,6 +375,9 @@ const MNN::Transformer::LlmContext * LlmSession::Response(const std::string &pro
     } else {
         MNN_DEBUG("No multimodal content detected, using regular text API");
         llm_->response(history_, &output_ostream, "<eop>", 0);
+    }
+    if (is_opencl_backend) {
+        llm_->switchMode(MNN::Transformer::Llm::Decode);
     }
     resolveAndroidSteppingEop(llm_, stream_state, current_size, max_new_tokens_);
     while (!stop_requested_ && !generate_text_end_ && current_size < max_new_tokens_) {
@@ -785,6 +812,14 @@ bool LlmSession::runKvCacheTest(int iteration, int nPrompt, int nGenerate,
         return false;
     }
     
+    // See the matching comment in Response(): switchMode() (not Llm::tuning(),
+    // which hard no-ops for backend_type=="opencl") is what actually controls
+    // OpenCL's OP_ENCODER_NUMBER_FOR_COMMIT record-queue hint. This single
+    // combined call does prefill+decode together, so - mirroring llm_bench.cpp's
+    // own kv-cache test branch - only the Prefill mode is set beforehand.
+    if (current_config_.value("backend_type", "cpu") == "opencl") {
+        llm->switchMode(MNN::Transformer::Llm::Prefill);
+    }
     llm->response(tokens, nullptr, nullptr, nGenerate);
     
     // Re-get context after response to ensure it's still valid
@@ -821,8 +856,12 @@ bool LlmSession::runLlamaBenchTest(int iteration, int nPrompt, int nGenerate,
         return false;
     }
     MNN_DEBUG("runLlamaBenchTest nPrompt:%d, nGenerate:%d tokens:\n", nPrompt, nGenerate);
+    bool is_opencl_backend = current_config_.value("backend_type", "cpu") == "opencl";
     if (nPrompt > 0) {
         MNN_DEBUG("runLlamaBenchTest prefill begin");
+        if (is_opencl_backend) {
+            llm->switchMode(MNN::Transformer::Llm::Prefill);
+        }
         llm->response(tokens, nullptr, nullptr, 1);
         MNN_DEBUG("runLlamaBenchTest prefill beginx");
         auto context = llm->getContext();
@@ -837,6 +876,9 @@ bool LlmSession::runLlamaBenchTest(int iteration, int nPrompt, int nGenerate,
     
     if (nGenerate > 0) {
         MNN_DEBUG("runLlamaBenchTest generate begin");
+        if (is_opencl_backend) {
+            llm->switchMode(MNN::Transformer::Llm::Decode);
+        }
         llm->response(tokens1, nullptr, nullptr, nGenerate);
 
         auto context = llm->getContext();

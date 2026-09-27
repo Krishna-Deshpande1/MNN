@@ -71,6 +71,15 @@ class BenchmarkHeadlessReceiver : BroadcastReceiver() {
         const val EXTRA_TOP_P = "top_p"
         const val EXTRA_MIN_P = "min_p"
         const val EXTRA_BACKEND_TYPE = "backend_type"
+        // Both optional, both default to the original single-broadcast
+        // single-generation behavior (0 warmups, 1 trial). When trials>1
+        // or warmup_runs>0, the whole sweep runs against ONE loaded
+        // LlmSession instead of a fresh session per generation - see
+        // HeadlessBenchmarkRunner's class kdoc for why that matters for
+        // GPU backends specifically (OpenCL kernel JIT-compile cost is
+        // only amortized across calls sharing one live session).
+        const val EXTRA_WARMUP_RUNS = "warmup_runs"
+        const val EXTRA_TRIALS = "trials"
         private const val TAG = "BenchmarkHeadlessReceiver"
     }
 
@@ -90,10 +99,13 @@ class BenchmarkHeadlessReceiver : BroadcastReceiver() {
         val topP = if (intent.hasExtra(EXTRA_TOP_P)) intent.getFloatExtra(EXTRA_TOP_P, 0f) else null
         val minP = if (intent.hasExtra(EXTRA_MIN_P)) intent.getFloatExtra(EXTRA_MIN_P, 0f) else null
         val backendType = intent.getStringExtra(EXTRA_BACKEND_TYPE)
+        val warmupRuns = intent.getIntExtra(EXTRA_WARMUP_RUNS, 0)
+        val trials = intent.getIntExtra(EXTRA_TRIALS, 1)
         Log.i(
             TAG,
             "Received RUN_PROMPT run_id=$runId model_path=$modelPath max_tokens=$maxTokens " +
-                "top_k=$topK top_p=$topP min_p=$minP backend_type=$backendType"
+                "top_k=$topK top_p=$topP min_p=$minP backend_type=$backendType " +
+                "warmup_runs=$warmupRuns trials=$trials"
         )
 
         if (modelPath.isNullOrBlank() || prompt.isNullOrBlank() || runId.isNullOrBlank()) {
@@ -114,6 +126,8 @@ class BenchmarkHeadlessReceiver : BroadcastReceiver() {
             topP?.let { putExtra(EXTRA_TOP_P, it) }
             minP?.let { putExtra(EXTRA_MIN_P, it) }
             backendType?.let { putExtra(EXTRA_BACKEND_TYPE, it) }
+            putExtra(EXTRA_WARMUP_RUNS, warmupRuns)
+            putExtra(EXTRA_TRIALS, trials)
         }
         // startForegroundService() from a BroadcastReceiver responding to an
         // external broadcast is an explicitly permitted background-start
