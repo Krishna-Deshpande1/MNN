@@ -161,7 +161,8 @@ class HeadlessBenchmarkRunner(private val context: Context) {
                 Log.i(LOG_TAG, "run_id=$runId SWEEP_STEP phase=warmup index=$w sub_run_id=$subRunId")
                 runOneGeneration(
                     newSession, prompt, subRunId, powerSampler, thermalSampler,
-                    coldLoadMs = if (isFirstGeneration) coldLoadMs else null
+                    coldLoadMs = if (isFirstGeneration) coldLoadMs else null,
+                    loadStartEpochMs = if (isFirstGeneration) coldLoadStartMs else null
                 )
                 isFirstGeneration = false
             }
@@ -170,7 +171,8 @@ class HeadlessBenchmarkRunner(private val context: Context) {
                 Log.i(LOG_TAG, "run_id=$runId SWEEP_STEP phase=trial index=$t sub_run_id=$subRunId")
                 runOneGeneration(
                     newSession, prompt, subRunId, powerSampler, thermalSampler,
-                    coldLoadMs = if (isFirstGeneration) coldLoadMs else null
+                    coldLoadMs = if (isFirstGeneration) coldLoadMs else null,
+                    loadStartEpochMs = if (isFirstGeneration) coldLoadStartMs else null
                 )
                 isFirstGeneration = false
             }
@@ -214,10 +216,19 @@ class HeadlessBenchmarkRunner(private val context: Context) {
         subRunId: String,
         powerSampler: PowerSampler,
         thermalSampler: ThermalSampler,
-        coldLoadMs: Long?
+        coldLoadMs: Long?,
+        loadStartEpochMs: Long? = null
     ) {
         val ttftCapturedNanos = AtomicLong(-1)
         val requestStartNanos = System.nanoTime()
+        // Wall-clock markers (epoch ms) logged as tags below so the host harness can compute TTLT,
+        // decode rate and energy windows without any per-chunk logging. OPLUS logd drops a process's
+        // log lines beyond ~300 rows per second, and one line per streamed chunk overflowed that,
+        // silently dropping the result tags (the harness then waited forever).
+        val dispatchEpochMs = System.currentTimeMillis()
+        var firstChunkEpochMs = -1L
+        var lastChunkEpochMs = -1L
+        var streamChunks = 0
         val responseBuilder = StringBuilder()
 
         // Power/thermal are sampled only across the inference window itself
@@ -226,19 +237,8 @@ class HeadlessBenchmarkRunner(private val context: Context) {
         powerSampler.start(intervalMs = 100)
         thermalSampler.start(intervalMs = 1000)
 
-        // TEMPORARY: RESPDEBUG logs every onProgress invocation, same
-        // style as the earlier blank-response investigation (that one
-        // was root-caused to an embedded-newline logcat artifact, fixed
-        // by escapeForSingleLineLog() on RUN_DONE). Re-added because the
-        // same 100%-blank symptom is now showing on Qwen3.5-2B, which
-        // uses a different response format ("Thinking Process:" plain
-        // text instead of <think></think>) - this may be a distinct
-        // root cause. Remove once confirmed and fixed.
-        var respDebugCallCount = 0
         val result = session.generate(prompt, emptyMap(), object : GenerateProgressListener {
             override fun onProgress(progress: String?): Boolean {
-                respDebugCallCount++
-                val lengthBefore = responseBuilder.length
                 if (progress != null) {
                     // Wall-clock TTFT: time from submit to the first
                     // actual streamed token, captured in Kotlin. This is
@@ -246,16 +246,12 @@ class HeadlessBenchmarkRunner(private val context: Context) {
                     // below - it also captures JNI dispatch/scheduling
                     // overhead that native compute time alone misses.
                     ttftCapturedNanos.compareAndSet(-1L, System.nanoTime() - requestStartNanos)
+                    val now = System.currentTimeMillis()
+                    if (firstChunkEpochMs < 0) firstChunkEpochMs = now
+                    lastChunkEpochMs = now
+                    streamChunks++
                     responseBuilder.append(progress)
                 }
-                Log.i(
-                    "RESPDEBUG",
-                    "run_id=$subRunId onProgress call #$respDebugCallCount raw_chunk=${
-                        progress?.let { "\"${escapeForSingleLineLog(it)}\"" } ?: "null"
-                    } chunkLength=${progress?.length ?: 0} responseBuilderLengthBefore=$lengthBefore " +
-                        "responseBuilderLengthAfter=${responseBuilder.length} thread=${Thread.currentThread().name} " +
-                        "ts=${System.currentTimeMillis()}"
-                )
                 if (progress != null) {
                     // Additional safety net alongside the token cap above:
                     // a stuck model can loop on the same short substring
@@ -275,12 +271,6 @@ class HeadlessBenchmarkRunner(private val context: Context) {
                 return false // never request early stop otherwise for a benchmark run
             }
         })
-        Log.i(
-            "RESPDEBUG",
-            "run_id=$subRunId onProgress total calls=$respDebugCallCount final responseBuilder length=${responseBuilder.length} " +
-                "content=\"${escapeForSingleLineLog(responseBuilder.toString())}\""
-        )
-
         powerSampler.stop()
         thermalSampler.stop()
 
@@ -302,6 +292,13 @@ class HeadlessBenchmarkRunner(private val context: Context) {
             Log.i(LOG_TAG, "run_id=$subRunId COLD_LOAD_MS=$coldLoadMs")
         }
         Log.i(LOG_TAG, "run_id=$subRunId TTFT_MS=$ttftMs")
+        Log.i(LOG_TAG, "run_id=$subRunId DISPATCH_EPOCH_MS=$dispatchEpochMs")
+        Log.i(LOG_TAG, "run_id=$subRunId FIRST_TOKEN_EPOCH_MS=${if (firstChunkEpochMs >= 0) firstChunkEpochMs else "unavailable"}")
+        Log.i(LOG_TAG, "run_id=$subRunId LAST_TOKEN_EPOCH_MS=${if (lastChunkEpochMs >= 0) lastChunkEpochMs else "unavailable"}")
+        Log.i(LOG_TAG, "run_id=$subRunId STREAM_CHUNKS=$streamChunks")
+        if (loadStartEpochMs != null) {
+            Log.i(LOG_TAG, "run_id=$subRunId LOAD_START_EPOCH_MS=$loadStartEpochMs")
+        }
         Log.i(LOG_TAG, "run_id=$subRunId PREFILL_TIME_US=$prefillTimeUs")
         Log.i(LOG_TAG, "run_id=$subRunId DECODE_TIME_US=$decodeTimeUs")
         Log.i(LOG_TAG, "run_id=$subRunId PROMPT_LEN=$promptLen")
